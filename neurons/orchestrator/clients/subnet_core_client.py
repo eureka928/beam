@@ -449,11 +449,7 @@ class SubnetCoreClient:
                 reconnect_delay = self._reconnect_delay  # Reset on successful connection
                 await self._ws_message_loop()
             except ConnectionClosed as e:
-                logger.warning(f"WebSocket closed: {e}")
-                if e.rcvd and e.rcvd.code == 1008:
-                    self._api_key = None
-                    self._api_key_expires = None
-                    self._skip_env_key = True
+                self._log_websocket_closed(e)
             except Exception as e:
                 logger.error(f"WebSocket error: {e}")
 
@@ -501,6 +497,31 @@ class SubnetCoreClient:
         }
         logger.info(f"Registration config set: region={region}, max_workers={max_workers}")
 
+    def _log_websocket_closed(self, closed: ConnectionClosed) -> None:
+        """Log orch-gateway close codes with operator-facing context."""
+        code = closed.rcvd.code if closed.rcvd else None
+        if code == 4001:
+            logger.warning(
+                "Orch-gateway closed the WebSocket with code 4001 (unauthorized) for hotkey %s. "
+                "Use an active orchestrator-role API key that belongs to this hotkey. "
+                "Typical causes: BEAMCORE_API_KEY is a worker or client key, the hotkey was first "
+                "registered as a worker in Beam, or the key does not match the wallet in the URL. "
+                "Obtain a key via POST /auth/challenge and POST /auth/verify with role orchestrator, "
+                "then set BEAMCORE_API_KEY. Detail: %s",
+                self.orchestrator_hotkey,
+                closed,
+            )
+            self._api_key = None
+            self._api_key_expires = None
+            self._skip_env_key = True
+            return
+
+        logger.warning("WebSocket closed: %s", closed)
+        if code == 1008:
+            self._api_key = None
+            self._api_key_expires = None
+            self._skip_env_key = True
+
     async def _connect_websocket(self):
         """Connect to WebSocket endpoint."""
         # Get API key for authentication (required by buffer service)
@@ -536,7 +557,10 @@ class SubnetCoreClient:
         self._ws_connected = True
         self._registered = False  # Reset on new connection
         self._last_confirmed_ready = None
-        logger.info(f"WebSocket connected to {url}")
+        logger.info(
+            "WebSocket transport open to %s — orch-gateway authorizes X-Api-Key after the handshake",
+            url,
+        )
 
         # Auto-register if config is set
         if self._registration_config:
@@ -692,7 +716,15 @@ class SubnetCoreClient:
                 await self._ws.send(json.dumps({"type": "pong"}))
 
         elif msg_type == "error":
-            self._maybe_upstream_error_payload(data)
+            if data.get("code") == "unauthorized":
+                logger.warning(
+                    "Orch-gateway authorization rejected hotkey %s: reason=%s message=%s",
+                    data.get("hotkey") or self.orchestrator_hotkey,
+                    data.get("reason"),
+                    data.get("message"),
+                )
+            else:
+                self._maybe_upstream_error_payload(data)
 
         else:
             logger.debug(f"Unknown WebSocket message type: {msg_type}")
@@ -951,7 +983,9 @@ class SubnetCoreClient:
         try:
             await self._ws.send(json.dumps(message))
             logger.info(
-                "Sent registration via WebSocket: region=%s, fee=%s%%, desired_ready=%s",
+                "Sent registration via WebSocket for %s (orch-gateway relays it only after "
+                "orchestrator API key authorization): region=%s, fee=%s%%, desired_ready=%s",
+                self.orchestrator_hotkey,
                 region,
                 fee_percentage,
                 self._desired_ready,
